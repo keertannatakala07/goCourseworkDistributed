@@ -68,7 +68,7 @@ func distributor(p Params, c distributorChannels) {
 
 	completedTurns := 0
 
-	client, err := rpc.Dial("tcp", "100.54.203.141:8080")
+	client, err := rpc.Dial("tcp", "127.0.0.1:8080")
 	if err != nil {
 		fmt.Println("Error: ", err)
 		return
@@ -121,11 +121,28 @@ func distributor(p Params, c distributorChannels) {
 
 	aliveCells := calculateAliveCells(p, worldSlice)
 
-	c.events <- FinalTurnComplete{CompletedTurns: completedTurns, Alive: aliveCells}
+	c.ioCommand <- ioOutput
+	var outputFilename string
 
+	outputFilename = fmt.Sprintf("%dx%dx%d", p.ImageWidth, p.ImageHeight, completedTurns)
+
+	c.ioFilename <- outputFilename
+
+	for row := 0; row < p.ImageHeight; row++ {
+		for column := 0; column < p.ImageWidth; column++ {
+			c.ioOutput <- worldSlice[row][column]
+		}
+	}
+
+	// Make sure that the Io has finished any output before exiting.
 	c.ioCommand <- ioCheckIdle
 	<-c.ioIdle
 
+	// TODO: Report the final state using FinalTurnCompleteEvent.
+	c.events <- FinalTurnComplete{CompletedTurns: completedTurns, Alive: aliveCells}
+	c.events <- ImageOutputComplete{CompletedTurns: completedTurns, Filename: outputFilename}
 	c.events <- StateChange{turn, Quitting}
+
+	// Close the channel to stop the SDL goroutine gracefully. Removing may cause deadlock.
 	close(c.events)
 }
