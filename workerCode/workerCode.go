@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/rpc"
 	"sync"
+	"time"
 )
 
 type CalculateTurnService struct {
@@ -13,6 +14,9 @@ type CalculateTurnService struct {
 	completedTurns int
 	height         int
 	width          int
+	paused         bool
+	mustQuit       bool
+	listener       net.Listener
 }
 
 type Request struct {
@@ -26,6 +30,17 @@ type Response struct {
 	NewWorldSlice  [][]byte
 	CompletedTurns int
 	AliveCells     int
+}
+
+type KeyPressRequest struct {
+	Key rune
+}
+
+type KeyPressResponse struct {
+	Paused         bool
+	SaveRequested  bool
+	SaveWorld      [][]byte
+	CompletedTurns int
 }
 
 type EmptyArgs struct{}
@@ -77,16 +92,26 @@ func countAliveCells(height, width int, world [][]byte) int {
 
 func (ct *CalculateTurnService) CalculateTurns(request Request, response *Response) error {
 	fmt.Println("Accepted CalculateTurns request")
-
 	ct.mu.Lock()
 	ct.world = request.WorldSlice
 	ct.height = request.ImageHeight
 	ct.width = request.ImageWidth
 	ct.completedTurns = 0
+	ct.paused = false
+	ct.mustQuit = false
 	ct.mu.Unlock()
 
 	for i := 0; i < request.Turns; i++ {
 		ct.mu.Lock()
+		for ct.paused && !ct.mustQuit {
+			ct.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			ct.mu.Lock()
+		}
+		if ct.mustQuit {
+			ct.mu.Unlock()
+			break
+		}
 		ct.world = calculateNextState(ct.height, ct.width, ct.world)
 		ct.completedTurns = i + 1
 		ct.mu.Unlock()
@@ -102,7 +127,59 @@ func (ct *CalculateTurnService) CalculateTurns(request Request, response *Respon
 	return nil
 }
 
-// GetAliveCells handles the ticker request from the local controller every 2 seconds
+func (ct *CalculateTurnService) HandleKeyPress(request KeyPressRequest, response *KeyPressResponse) error {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	switch request.Key {
+	case 's':
+		response.SaveRequested = true
+		response.CompletedTurns = ct.completedTurns
+		response.SaveWorld = make([][]byte, len(ct.world))
+		for i := range ct.world {
+			response.SaveWorld[i] = make([]byte, len(ct.world[i]))
+			copy(response.SaveWorld[i], ct.world[i])
+		}
+	case 'p':
+		ct.paused = !ct.paused
+		response.Paused = ct.paused
+		response.CompletedTurns = ct.completedTurns
+	case 'q':
+		ct.mustQuit = true
+		ct.paused = false
+		response.SaveRequested = true
+		response.CompletedTurns = ct.completedTurns
+		response.Paused = false
+		response.SaveWorld = make([][]byte, len(ct.world))
+		for i := range ct.world {
+			response.SaveWorld[i] = make([]byte, len(ct.world[i]))
+			copy(response.SaveWorld[i], ct.world[i])
+		}
+	case 'k':
+		ct.mustQuit = true
+		ct.paused = false
+		response.SaveRequested = true
+		response.CompletedTurns = ct.completedTurns
+		response.Paused = false
+		response.SaveWorld = make([][]byte, len(ct.world))
+		for i := range ct.world {
+			response.SaveWorld[i] = make([]byte, len(ct.world[i]))
+			copy(response.SaveWorld[i], ct.world[i])
+		}
+
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			if ct.listener != nil {
+				ct.listener.Close()
+			}
+		}()
+	default:
+		response.CompletedTurns = ct.completedTurns
+	}
+
+	return nil
+}
+
 func (ct *CalculateTurnService) GetAliveCells(args *EmptyArgs, response *Response) error {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
@@ -125,12 +202,14 @@ func main() {
 		fmt.Println("Failed to register RPC: ", err)
 	}
 
-	listener, err := net.Listen("tcp", "0.0.0.0:8080")
+	listener, err := net.Listen("tcp", "localhost:8080")
 	if err != nil {
 		fmt.Println("Failed to listen: ", err)
 	}
 	defer listener.Close()
 
-	fmt.Println("Listening on 0.0.0.0:8080...")
+	service.listener = listener
+
+	fmt.Println("Listening on localhost:8080...")
 	rpc.Accept(listener)
 }

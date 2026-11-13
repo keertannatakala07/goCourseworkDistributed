@@ -70,6 +70,7 @@ func main() {
 }
 
 func sigint() {
+
 	sigint := make(chan os.Signal, 1)
 	signal.Notify(sigint, syscall.SIGINT, syscall.SIGTERM)
 	var exit atomic.Bool
