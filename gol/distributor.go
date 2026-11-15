@@ -1,6 +1,7 @@
 package gol
 
 import (
+	"encoding/gob"
 	"fmt"
 	"net/rpc"
 	"sync"
@@ -45,6 +46,23 @@ type KeyPressResponse struct {
 
 type EmptyArgs struct{}
 
+type WorkerSliceRequest struct {
+	GolSlice        [][]byte
+	Turns           int
+	ImageWidth      int
+	Height          int
+	WorkerIndex     int
+	NumberOfWorkers int
+	AboveWorker     string
+	BelowWorker     string
+}
+
+type WorkerSliceResponse struct {
+	NewGolSlice    [][]byte
+	CompletedTurns int
+	AliveCells     int
+}
+
 func calculateAliveCells(p Params, world [][]byte) []util.Cell {
 	cellCoordsSlice := []util.Cell{}
 
@@ -61,6 +79,7 @@ func calculateAliveCells(p Params, world [][]byte) []util.Cell {
 
 // distributor divides the work between workers and interacts with other goroutines.
 func distributor(p Params, c distributorChannels) {
+	gob.Register([][]byte{})
 	c.ioCommand <- ioInput
 	filename := fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight)
 	c.ioFilename <- filename
@@ -79,23 +98,14 @@ func distributor(p Params, c distributorChannels) {
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 
-	completedTurns := 0
+	workerAddresses := []string{"127.0.0.1:8080", "127.0.0.1:8081"}
+	totalWorkers := len(workerAddresses)
+	chunks := p.ImageHeight / totalWorkers
 
-	client, err := rpc.Dial("tcp", "127.0.0.1:8080")
-	if err != nil {
-		fmt.Println("Error: ", err)
-		return
-	}
-	defer client.Close()
+	var wg sync.WaitGroup
+	var mut sync.Mutex
+	endResponses := make([]WorkerSliceResponse, totalWorkers)
 
-	req := Request{
-		WorldSlice:  worldSlice,
-		Turns:       p.Turns,
-		ImageHeight: p.ImageHeight,
-		ImageWidth:  p.ImageWidth,
-	}
-
-	var res Response
 	var mu sync.Mutex
 	paused := false
 
@@ -114,6 +124,12 @@ func distributor(p Params, c distributorChannels) {
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
+
+		client, err := rpc.Dial("tcp", workerAddresses[0])
+		if err != nil {
+			return
+		}
+		defer client.Close()
 
 		for {
 			select {
@@ -140,6 +156,11 @@ func distributor(p Params, c distributorChannels) {
 	}()
 
 	go func() {
+		client, err := rpc.Dial("tcp", workerAddresses[0])
+		if err != nil {
+			return
+		}
+		defer client.Close()
 		for {
 			select {
 			case k := <-c.keyPresses:
@@ -212,18 +233,77 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}()
 
-	err = client.Call("CalculateTurnService.CalculateTurns", req, &res)
+	for i := 0; i < totalWorkers; i++ {
+		wg.Add(1)
+		go func(workerIx int) {
+			defer wg.Done()
 
-	shutdown()
+			startY := workerIx * chunks
+			endY := (workerIx + 1) * chunks
 
-	if err != nil {
-		fmt.Println("Error: ", err)
+			if workerIx == totalWorkers-1 {
+				endY = p.ImageHeight
+			}
+
+			subSlice := worldSlice[startY:endY]
+
+			client, err := rpc.Dial("tcp", workerAddresses[workerIx])
+			if err != nil {
+				fmt.Printf("Error connecting")
+				return
+			}
+			defer client.Close()
+
+			var aboveAddress, belowAddress string
+
+			if workerIx > 0 {
+				aboveAddress = workerAddresses[workerIx-1]
+
+			}
+			if workerIx < totalWorkers-1 {
+				belowAddress = workerAddresses[workerIx+1]
+			}
+
+			request := WorkerSliceRequest{
+				GolSlice:        subSlice,
+				Turns:           p.Turns,
+				ImageWidth:      p.ImageWidth,
+				Height:          p.ImageHeight,
+				WorkerIndex:     workerIx,
+				NumberOfWorkers: totalWorkers,
+				AboveWorker:     aboveAddress,
+				BelowWorker:     belowAddress,
+			}
+
+			var res WorkerSliceResponse
+			client.Call("CalculateTurnService.CalculateTurns", request, &res)
+
+			mut.Lock()
+			endResponses[workerIx] = res
+			mut.Unlock()
+		}(i)
+
 	}
 
-	worldSlice = res.NewWorldSlice
-	completedTurns = res.CompletedTurns
+	wg.Wait()
+	shutdown()
 
-	aliveCells := calculateAliveCells(p, worldSlice)
+	worldPutTogether := make([][]byte, p.ImageHeight)
+	totalAlive := 0
+
+	for workerIx, res := range endResponses {
+		startY := workerIx * chunks
+		for rIx, row := range res.NewGolSlice {
+			worldRow := startY + rIx
+			if worldRow < p.ImageHeight {
+				worldPutTogether[worldRow] = row
+			}
+		}
+		totalAlive += res.AliveCells
+	}
+
+	completedTurns := p.Turns
+	aliveCells := calculateAliveCells(p, worldPutTogether)
 
 	c.ioCommand <- ioOutput
 	var outputFilename string
@@ -234,7 +314,7 @@ func distributor(p Params, c distributorChannels) {
 
 	for row := 0; row < p.ImageHeight; row++ {
 		for column := 0; column < p.ImageWidth; column++ {
-			c.ioOutput <- worldSlice[row][column]
+			c.ioOutput <- worldPutTogether[row][column]
 		}
 	}
 
