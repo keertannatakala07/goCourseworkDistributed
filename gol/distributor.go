@@ -1,6 +1,9 @@
 package gol
 
 import (
+	//go binary, serialisation engine used by net/rpc
+	//Network sockets only transmit raw byte streams, not pointers/slices
+	//converts Go structs into bytes on sender, reconstructs reciever side
 	"encoding/gob"
 	"fmt"
 	"net/rpc"
@@ -20,6 +23,7 @@ type distributorChannels struct {
 	keyPresses <-chan rune
 }
 
+// sent over RPC to the brokers 'startState' method (initial world + parameters)
 type Request struct {
 	WorldSlice  [][]byte
 	Turns       int
@@ -27,12 +31,15 @@ type Request struct {
 	ImageWidth  int
 }
 
+// response from the broker with the ended simulation
+// rpc cannot directly return values -> server writes results -> pointer to a reply struct
 type Response struct {
 	NewWorldSlice  [][]byte
 	CompletedTurns int
 	AliveCells     int
 }
 
+// wraps keyboard character (rune = alias int32)
 type KeyPressRequest struct {
 	Key rune
 }
@@ -44,8 +51,10 @@ type KeyPressResponse struct {
 	CompletedTurns int
 }
 
+// used when an RPC call needs no input
 type EmptyArgs struct{}
 
+// converts grid of bytes into x,y coord structs as FinalTurnComplete expects this slice
 func calculateAliveCells(p Params, world [][]byte) []util.Cell {
 	cellCoordsSlice := []util.Cell{}
 
@@ -63,6 +72,8 @@ func calculateAliveCells(p Params, world [][]byte) []util.Cell {
 // distributor divides the work between workers and interacts with other goroutines.
 func distributor(p Params, c distributorChannels) {
 	gob.Register([][]byte{})
+
+	//Loads initial world
 	c.ioCommand <- ioInput
 	filename := fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight)
 	c.ioFilename <- filename
@@ -81,8 +92,11 @@ func distributor(p Params, c distributorChannels) {
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 
+	//hardcoded address for bthe broker
+
 	brokerAddress := "127.0.0.1:8080"
 
+	//ticker
 	var mu sync.Mutex
 	paused := false
 
@@ -130,6 +144,8 @@ func distributor(p Params, c distributorChannels) {
 			}
 		}
 	}()
+
+	//keypresses
 
 	go func() {
 		client, err := rpc.Dial("tcp", brokerAddress)
@@ -209,6 +225,8 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}()
 
+	//dial the broker over tcp for the primary game execution call
+
 	client, err := rpc.Dial("tcp", brokerAddress)
 	if err != nil {
 		shutdown()
@@ -216,6 +234,7 @@ func distributor(p Params, c distributorChannels) {
 	}
 	defer client.Close()
 
+	//package grid into request
 	req := Request{
 		WorldSlice:  worldSlice,
 		Turns:       p.Turns,
@@ -224,6 +243,10 @@ func distributor(p Params, c distributorChannels) {
 	}
 
 	var res Response
+
+	//RPC execution
+	//blocks on the main goroutine whilst request is sent, broker slices it horizontally and gets workers to work on it.
+	//Broker puts worker results back into NewWorldSlice -> res
 	err = client.Call("BrokerService.StartState", req, &res)
 
 	shutdown()

@@ -66,6 +66,7 @@ type WorkerSliceResponse struct {
 	AliveCells     int
 }
 
+// RPC receiver struct, exported methods exposed over network
 type BrokerService struct {
 	workerAddresses []string
 	imageHeight     int
@@ -73,7 +74,14 @@ type BrokerService struct {
 	listener        net.Listener
 }
 
+// 1. Receives full initial grid from the local controller
+// 2. Splits grid horizontally into strips
+// 3. Concurrently dials every worker in parallel goroutines and uses CalculateTurnService.CalculateTurns
+// 4. Waits for all workers to finish using sync.WaitGroup -> puts slices back into one cohesive 2D grid
+// sums alive cells -> returns the response to the local controller.
 func (b *BrokerService) StartState(req Request, res *Response) error {
+
+	//stores the grid dimensions on Broker struct so that handleKeyPress can reconstruct it mid game
 	b.imageHeight = req.ImageHeight
 	b.imageWidth = req.ImageWidth
 
@@ -92,12 +100,14 @@ func (b *BrokerService) StartState(req Request, res *Response) error {
 			startY := workerIx * chunks
 			endY := (workerIx + 1) * chunks
 
+			//not evenly split, remaining rows to last worker
 			if workerIx == totalWorkers-1 {
 				endY = req.ImageHeight
 			}
 
 			subSlice := req.WorldSlice[startY:endY]
 
+			//open PRC connection to specific worker
 			client, err := rpc.Dial("tcp", b.workerAddresses[workerIx])
 			if err != nil {
 				fmt.Printf("Error connecting")
@@ -105,9 +115,12 @@ func (b *BrokerService) StartState(req Request, res *Response) error {
 			}
 			defer client.Close()
 
+			//determines neighbour addresses for workers to exchange their halo rows with each other,
+			//without routing through Broker, preventing a network bottleneck
 			var aboveAddress, belowAddress string
 
 			if workerIx > 0 {
+				//every worker except the top one has an above neighbour
 				aboveAddress = b.workerAddresses[workerIx-1]
 
 			}
@@ -126,6 +139,7 @@ func (b *BrokerService) StartState(req Request, res *Response) error {
 				BelowWorker:     belowAddress,
 			}
 
+			//waits until the worker finishes all Turns or quits early
 			var res WorkerSliceResponse
 			client.Call("CalculateTurnService.CalculateTurns", request, &res)
 
@@ -136,8 +150,10 @@ func (b *BrokerService) StartState(req Request, res *Response) error {
 
 	}
 
+	//waits until all worker goroutines are done
 	wg.Wait()
 
+	//puts back worker slices into complete world
 	worldPutTogether := make([][]byte, req.ImageHeight)
 	totalAlive := 0
 
@@ -159,6 +175,7 @@ func (b *BrokerService) StartState(req Request, res *Response) error {
 	return nil
 }
 
+// called every 2 secs by ticker
 func (b *BrokerService) GetAliveCells(args *EmptyArgs, res *Response) error {
 	totalAlive := 0
 	completedTurns := 0
@@ -186,6 +203,7 @@ func (b *BrokerService) GetAliveCells(args *EmptyArgs, res *Response) error {
 	return nil
 }
 
+// broadcasts keypress to all workers so they can do whatever in unison
 func (b *BrokerService) HandleKeyPress(req KeyPressRequest, res *KeyPressResponse) error {
 	totalWorkers := len(b.workerAddresses)
 	chunks := b.imageHeight / totalWorkers

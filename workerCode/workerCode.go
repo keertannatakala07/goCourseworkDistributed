@@ -73,13 +73,12 @@ type WorkerSliceResponse struct {
 	AliveCells     int
 }
 
-func (ct *CalculateTurnService) ShareHalo(req HaloRequest, res *HaloResponse) error {
-	ct.mu.Lock()
-	defer ct.mu.Unlock()
-	res.Row = req.Row
-	return nil
-}
-
+// called by RPC by worker directly below
+// Locks ct.mu and checks if ct.world is initialised and ct.completedTurns >= req.Turn
+// If lagging behind the caller's turn, we temporarily unlock ct.mu
+// (so our own CalculateTurns loop isn't deadlocked and can keep computing) sleep -> re-check until caught up
+// Then we allocate a new copyOfRow and copy(...) the bytes so net/rpc can
+// serialize over network while our worker moves on to the next turn without a data race
 func (ct *CalculateTurnService) GetBottomRow(req HaloRequest, res *HaloResponse) error {
 	ct.mu.Lock()
 
@@ -127,6 +126,7 @@ func nextStateRow(rowIndex int, width int, world [][]byte, aboveHalo, belowHalo 
 	for i := 0; i < width; i++ {
 		aliveCells := 0
 
+		//loops over 3x3 neighbours
 		for dr := -1; dr <= 1; dr++ {
 			for dc := -1; dc <= 1; dc++ {
 				if dr == 0 && dc == 0 {
@@ -185,6 +185,7 @@ func countAliveCells(height, width int, world [][]byte) int {
 func (ct *CalculateTurnService) CalculateTurns(request WorkerSliceRequest, response *WorkerSliceResponse) error {
 	fmt.Printf("Worker %d: Accepted request for (rows: %d)\n", request.WorkerIndex, len(request.GolSlice))
 
+	//worker state under mutex lock
 	ct.mu.Lock()
 	ct.world = request.GolSlice
 	height := len(ct.world)
@@ -197,6 +198,7 @@ func (ct *CalculateTurnService) CalculateTurns(request WorkerSliceRequest, respo
 	ct.mu.Unlock()
 
 	for i := 0; i < request.Turns; i++ {
+		//check if paused/quit flags
 		ct.mu.Lock()
 		for ct.paused && !ct.mustQuit {
 			ct.mu.Unlock()
@@ -209,9 +211,11 @@ func (ct *CalculateTurnService) CalculateTurns(request WorkerSliceRequest, respo
 		}
 		ct.mu.Unlock()
 
+		//P2P halo exchange
 		var aboveHalo, belowHalo []byte
 		haloReq := HaloRequest{Turn: i}
 
+		// If we have a neighbor worker above us, fetch their bottom row (GetBottomRow).
 		if request.AboveWorker != "" {
 			client, err := rpc.Dial("tcp", request.AboveWorker)
 			if err == nil {
@@ -235,11 +239,14 @@ func (ct *CalculateTurnService) CalculateTurns(request WorkerSliceRequest, respo
 				client.Close()
 			}
 		}
+
+		//compute every row of next gen into a new grid
 		newWorld := make([][]byte, height)
 		for r := 0; r < height; r++ {
 			newWorld[r] = nextStateRow(r, request.ImageWidth, ct.world, aboveHalo, belowHalo, height)
 		}
 
+		//push new grid, increase turns so the halo callers see the state
 		ct.mu.Lock()
 		ct.world = newWorld
 		ct.completedTurns = i + 1
