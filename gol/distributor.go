@@ -46,23 +46,6 @@ type KeyPressResponse struct {
 
 type EmptyArgs struct{}
 
-type WorkerSliceRequest struct {
-	GolSlice        [][]byte
-	Turns           int
-	ImageWidth      int
-	Height          int
-	WorkerIndex     int
-	NumberOfWorkers int
-	AboveWorker     string
-	BelowWorker     string
-}
-
-type WorkerSliceResponse struct {
-	NewGolSlice    [][]byte
-	CompletedTurns int
-	AliveCells     int
-}
-
 func calculateAliveCells(p Params, world [][]byte) []util.Cell {
 	cellCoordsSlice := []util.Cell{}
 
@@ -98,13 +81,7 @@ func distributor(p Params, c distributorChannels) {
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 
-	workerAddresses := []string{"127.0.0.1:8080", "127.0.0.1:8081"}
-	totalWorkers := len(workerAddresses)
-	chunks := p.ImageHeight / totalWorkers
-
-	var wg sync.WaitGroup
-	var mut sync.Mutex
-	endResponses := make([]WorkerSliceResponse, totalWorkers)
+	brokerAddress := "127.0.0.1:8080"
 
 	var mu sync.Mutex
 	paused := false
@@ -125,7 +102,7 @@ func distributor(p Params, c distributorChannels) {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
-		client, err := rpc.Dial("tcp", workerAddresses[0])
+		client, err := rpc.Dial("tcp", brokerAddress)
 		if err != nil {
 			return
 		}
@@ -144,8 +121,7 @@ func distributor(p Params, c distributorChannels) {
 				}
 			case <-ticker.C:
 				var aliveRes Response
-				// Call the worker's GetAliveCells method every 2 seconds
-				err := client.Call("CalculateTurnService.GetAliveCells", &EmptyArgs{}, &aliveRes)
+				err := client.Call("BrokerService.GetAliveCells", &EmptyArgs{}, &aliveRes)
 				if err == nil {
 					c.events <- AliveCellsCount{CompletedTurns: aliveRes.CompletedTurns, CellsCount: aliveRes.AliveCells}
 				} else {
@@ -156,7 +132,7 @@ func distributor(p Params, c distributorChannels) {
 	}()
 
 	go func() {
-		client, err := rpc.Dial("tcp", workerAddresses[0])
+		client, err := rpc.Dial("tcp", brokerAddress)
 		if err != nil {
 			return
 		}
@@ -167,7 +143,7 @@ func distributor(p Params, c distributorChannels) {
 				// Forward key presses to the worker process so it owns the pause/quit/save state.
 				keyPressReq := KeyPressRequest{Key: k}
 				keyPressRes := KeyPressResponse{}
-				err := client.Call("CalculateTurnService.HandleKeyPress", keyPressReq, &keyPressRes)
+				err := client.Call("BrokerService.HandleKeyPress", keyPressReq, &keyPressRes)
 				if err != nil {
 					fmt.Println("Error handling key press:", err)
 					continue
@@ -233,76 +209,27 @@ func distributor(p Params, c distributorChannels) {
 		}
 	}()
 
-	for i := 0; i < totalWorkers; i++ {
-		wg.Add(1)
-		go func(workerIx int) {
-			defer wg.Done()
+	client, err := rpc.Dial("tcp", brokerAddress)
+	if err != nil {
+		shutdown()
+		return
+	}
+	defer client.Close()
 
-			startY := workerIx * chunks
-			endY := (workerIx + 1) * chunks
-
-			if workerIx == totalWorkers-1 {
-				endY = p.ImageHeight
-			}
-
-			subSlice := worldSlice[startY:endY]
-
-			client, err := rpc.Dial("tcp", workerAddresses[workerIx])
-			if err != nil {
-				fmt.Printf("Error connecting")
-				return
-			}
-			defer client.Close()
-
-			var aboveAddress, belowAddress string
-
-			if workerIx > 0 {
-				aboveAddress = workerAddresses[workerIx-1]
-
-			}
-			if workerIx < totalWorkers-1 {
-				belowAddress = workerAddresses[workerIx+1]
-			}
-
-			request := WorkerSliceRequest{
-				GolSlice:        subSlice,
-				Turns:           p.Turns,
-				ImageWidth:      p.ImageWidth,
-				Height:          p.ImageHeight,
-				WorkerIndex:     workerIx,
-				NumberOfWorkers: totalWorkers,
-				AboveWorker:     aboveAddress,
-				BelowWorker:     belowAddress,
-			}
-
-			var res WorkerSliceResponse
-			client.Call("CalculateTurnService.CalculateTurns", request, &res)
-
-			mut.Lock()
-			endResponses[workerIx] = res
-			mut.Unlock()
-		}(i)
-
+	req := Request{
+		WorldSlice:  worldSlice,
+		Turns:       p.Turns,
+		ImageHeight: p.ImageHeight,
+		ImageWidth:  p.ImageWidth,
 	}
 
-	wg.Wait()
+	var res Response
+	err = client.Call("BrokerService.StartState", req, &res)
+
 	shutdown()
 
-	worldPutTogether := make([][]byte, p.ImageHeight)
-	totalAlive := 0
-
-	for workerIx, res := range endResponses {
-		startY := workerIx * chunks
-		for rIx, row := range res.NewGolSlice {
-			worldRow := startY + rIx
-			if worldRow < p.ImageHeight {
-				worldPutTogether[worldRow] = row
-			}
-		}
-		totalAlive += res.AliveCells
-	}
-
-	completedTurns := p.Turns
+	worldPutTogether := res.NewWorldSlice
+	completedTurns := res.CompletedTurns
 	aliveCells := calculateAliveCells(p, worldPutTogether)
 
 	c.ioCommand <- ioOutput

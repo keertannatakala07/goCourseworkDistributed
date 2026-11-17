@@ -48,7 +48,8 @@ type KeyPressResponse struct {
 type EmptyArgs struct{}
 
 type HaloRequest struct {
-	Row []byte
+	Row  []byte
+	Turn int
 }
 
 type HaloResponse struct {
@@ -79,17 +80,45 @@ func (ct *CalculateTurnService) ShareHalo(req HaloRequest, res *HaloResponse) er
 	return nil
 }
 
-func (ct *CalculateTurnService) GetBottomRow(args EmptyArgs, res *HaloResponse) error {
+func (ct *CalculateTurnService) GetBottomRow(req HaloRequest, res *HaloResponse) error {
 	ct.mu.Lock()
+
+	for (len(ct.world) == 0 || ct.completedTurns < req.Turn) && !ct.mustQuit {
+		ct.mu.Unlock()
+		time.Sleep(1 * time.Millisecond)
+		ct.mu.Lock()
+	}
 	defer ct.mu.Unlock()
-	res.Row = ct.world[len(ct.world)-1]
+
+	if len(ct.world) == 0 {
+		return fmt.Errorf("world slice uninitialised")
+	}
+
+	copyOfRow := make([]byte, len(ct.world[len(ct.world)-1]))
+
+	copy(copyOfRow, ct.world[len(ct.world)-1])
+	res.Row = copyOfRow
 	return nil
 }
 
-func (ct *CalculateTurnService) GetTopRow(args EmptyArgs, res *HaloResponse) error {
+func (ct *CalculateTurnService) GetTopRow(req HaloRequest, res *HaloResponse) error {
 	ct.mu.Lock()
+
+	for (len(ct.world) == 0 || ct.completedTurns < req.Turn) && !ct.mustQuit {
+		ct.mu.Unlock()
+		time.Sleep(1 * time.Millisecond)
+		ct.mu.Lock()
+	}
 	defer ct.mu.Unlock()
-	res.Row = ct.world[0]
+
+	if len(ct.world) == 0 {
+		return fmt.Errorf("world slice uninitialised")
+	}
+
+	copyOfRow := make([]byte, len(ct.world[0]))
+
+	copy(copyOfRow, ct.world[0])
+	res.Row = copyOfRow
 	return nil
 }
 
@@ -130,49 +159,15 @@ func nextStateRow(rowIndex int, width int, world [][]byte, aboveHalo, belowHalo 
 		if world[rowIndex][i] == 255 {
 			if aliveCells == 2 || aliveCells == 3 {
 				newRow[i] = 255
-			} else {
-				if aliveCells == 3 {
-					newRow[i] = 255
-
-				}
+			}
+		} else {
+			if aliveCells == 3 {
+				newRow[i] = 255
 			}
 		}
 	}
 	return newRow
 
-}
-
-func calculateNextState(height, width int, world [][]byte) [][]byte {
-	newWorld := make([][]byte, height)
-	for i := range newWorld {
-		newWorld[i] = make([]byte, width)
-	}
-
-	for row := 0; row < height; row++ {
-		for column := 0; column < width; column++ {
-			liveCells := 0
-			for dr := -1; dr <= 1; dr++ {
-				for dc := -1; dc <= 1; dc++ {
-					if dr == 0 && dc == 0 {
-						continue
-					}
-					nRow := (row + dr + height) % height
-					nCol := (column + dc + width) % width
-					if world[nRow][nCol] == 255 {
-						liveCells++
-					}
-				}
-			}
-			if world[row][column] == 255 {
-				if liveCells == 2 || liveCells == 3 {
-					newWorld[row][column] = 255
-				}
-			} else if liveCells == 3 {
-				newWorld[row][column] = 255
-			}
-		}
-	}
-	return newWorld
 }
 
 func countAliveCells(height, width int, world [][]byte) int {
@@ -188,7 +183,7 @@ func countAliveCells(height, width int, world [][]byte) int {
 }
 
 func (ct *CalculateTurnService) CalculateTurns(request WorkerSliceRequest, response *WorkerSliceResponse) error {
-	fmt.Println("Worker %d: Accepted request for (rows: %d)\n")
+	fmt.Printf("Worker %d: Accepted request for (rows: %d)\n", request.WorkerIndex, len(request.GolSlice))
 
 	ct.mu.Lock()
 	ct.world = request.GolSlice
@@ -215,12 +210,13 @@ func (ct *CalculateTurnService) CalculateTurns(request WorkerSliceRequest, respo
 		ct.mu.Unlock()
 
 		var aboveHalo, belowHalo []byte
+		haloReq := HaloRequest{Turn: i}
 
 		if request.AboveWorker != "" {
 			client, err := rpc.Dial("tcp", request.AboveWorker)
 			if err == nil {
 				var haloRes HaloResponse
-				err := client.Call("CalculateTurnService.GetBottomRow", EmptyArgs{}, &haloRes)
+				err := client.Call("CalculateTurnService.GetBottomRow", haloReq, &haloRes)
 				if err == nil {
 					aboveHalo = haloRes.Row
 				}
@@ -232,7 +228,7 @@ func (ct *CalculateTurnService) CalculateTurns(request WorkerSliceRequest, respo
 			client, err := rpc.Dial("tcp", request.BelowWorker)
 			if err == nil {
 				var haloRes HaloResponse
-				err := client.Call("CalculateTurnService.GetTopRow", EmptyArgs{}, &haloRes)
+				err := client.Call("CalculateTurnService.GetTopRow", haloReq, &haloRes)
 				if err == nil {
 					belowHalo = haloRes.Row
 				}
@@ -240,8 +236,8 @@ func (ct *CalculateTurnService) CalculateTurns(request WorkerSliceRequest, respo
 			}
 		}
 		newWorld := make([][]byte, height)
-		for i := 0; i < height; i++ {
-			newWorld[i] = nextStateRow(i, request.ImageWidth, ct.world, aboveHalo, belowHalo, height)
+		for r := 0; r < height; r++ {
+			newWorld[r] = nextStateRow(r, request.ImageWidth, ct.world, aboveHalo, belowHalo, height)
 		}
 
 		ct.mu.Lock()
