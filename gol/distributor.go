@@ -247,7 +247,9 @@ func distributor(p Params, c distributorChannels) {
 	//RPC execution
 	//blocks on the main goroutine whilst request is sent, broker slices it horizontally and gets workers to work on it.
 	//Broker puts worker results back into NewWorldSlice -> res
+	start := time.Now()
 	err = client.Call("BrokerService.StartState", req, &res)
+	fmt.Println(time.Since(start))
 
 	shutdown()
 

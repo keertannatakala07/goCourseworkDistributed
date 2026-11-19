@@ -121,6 +121,8 @@ func (ct *CalculateTurnService) GetTopRow(req HaloRequest, res *HaloResponse) er
 	return nil
 }
 
+// calculates the next gen for one horizontal row
+// Uses the halo rows by checking above/below to calculate
 func nextStateRow(rowIndex int, width int, world [][]byte, aboveHalo, belowHalo []byte, height int) []byte {
 	newRow := make([]byte, width)
 	for i := 0; i < width; i++ {
@@ -156,6 +158,7 @@ func nextStateRow(rowIndex int, width int, world [][]byte, aboveHalo, belowHalo 
 			}
 		}
 
+		//applies GOL rules
 		if world[rowIndex][i] == 255 {
 			if aliveCells == 2 || aliveCells == 3 {
 				newRow[i] = 255
@@ -342,7 +345,7 @@ func main() {
 		fmt.Println("Failed to register RPC: ", err)
 	}
 
-	address := "localhost:" + *port
+	address := ":" + *port
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		fmt.Println("Failed to listen: ", err)
